@@ -2,6 +2,7 @@ use crate::sort::mergesort;
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::LinkedList;
+use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::{fs, io};
@@ -24,19 +25,22 @@ impl SmartPath {
             children: Rc::new(Cell::new(Vec::with_capacity(0))),
         }
     }
-    pub(crate) fn print(&self, padding: usize) {
+    pub(crate) fn print(&self, padding: usize, file: &mut Box<dyn Write>) -> io::Result<()> {
         let items = self.children.take();
         let name = self.fname.to_string_lossy();
-        println!(
+        writeln!(
+            file,
             "{}{}{}",
             " ".repeat(padding),
             name,
             if items.is_empty() { "" } else { "/" }
-        );
+        )?;
+
         for child in items.iter() {
-            child.print(padding + name.len() + 1)
+            child.print(padding + name.len() + 1, file)?
         }
         self.children.set(items);
+        Ok(())
     }
 }
 
@@ -65,17 +69,13 @@ impl PartialOrd<Self> for SmartPath {
 }
 
 impl Ord for SmartPath {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         self.fname.as_ref().cmp(other.fname.as_ref())
     }
 }
 
 pub fn file_search(
-    SearchArgs {
-        folder,
-        find,
-        sort,
-    }: SearchArgs,
+    SearchArgs { folder, find, sort }: SearchArgs,
 ) -> Result<Vec<SmartPath>, io::Error> {
     let mut ans: LinkedList<SmartPath> = LinkedList::new();
 

@@ -1,5 +1,5 @@
 #[inline]
-pub fn mergesort<T: Ord + Clone>(array: &mut [T]) {
+pub(crate) fn mergesort<T: Ord + Clone>(array: &mut [T]) {
     let mut vec: Vec<T> = Vec::with_capacity(array.len());
     mergesort_local(array, &mut vec);
 }
