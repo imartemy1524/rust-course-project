@@ -1,5 +1,5 @@
 mod file_search;
-mod test;
+mod sort;
 
 use std::path::PathBuf;
 use argh::FromArgs;
@@ -13,14 +13,28 @@ struct Arguments {
     folder: PathBuf,
 
     #[argh(option, description = "find")]
-    find: Option<PathBuf>
+    find: Option<PathBuf>,
+
+    #[argh(switch, description = "sort")]
+    sort: bool,
+
 }
 
 fn main() {
     let args: Arguments = argh::from_env();
-    file_search(SearchArgs{
-        padding: 0u32,
-        folder: args.folder,
-        find: args.find,
-    }).unwrap();
+    let ans = file_search(SearchArgs{
+        folder: &args.folder,
+        find: args.find.as_ref(),
+        sort: args.sort
+    });
+    match ans {
+        Ok(value) => {
+            for i in value{
+                i.print(0)
+            }
+        }
+        Err(err) => {
+            eprintln!("Error: {}", err);
+        }
+    }
 }
