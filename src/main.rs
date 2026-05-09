@@ -26,6 +26,9 @@ struct Arguments {
 
     #[argh(option, description = "output file")]
     f: Option<PathBuf>,
+
+    #[argh(option, description = "find text in file (only in .txt,.rs)")]
+    in_file: Option<String>,
 }
 
 #[inline]
@@ -34,6 +37,7 @@ fn run(args: Arguments) -> io::Result<()> {
         folder: &args.folder,
         find: args.find.as_ref(),
         sort: args.sort,
+        in_file: args.in_file.as_ref(),
     })?;
     let mut output = open_file(args.f)?;
     for i in ans {
