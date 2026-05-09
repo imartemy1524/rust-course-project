@@ -1,16 +1,15 @@
 use crate::sort::mergesort;
-use std::cell::Cell;
+use num_cpus;
 use std::cmp::Ordering;
 use std::io::{Error, Write};
-use std::ops::Deref;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, LazyLock};
 use std::thread::Scope;
 use std::{fs, io, thread};
-use std::hint::spin_loop;
+use log::debug;
 
 pub struct SearchArgs<'c> {
     pub folder: &'c PathBuf,
@@ -39,12 +38,7 @@ impl SmartPath {
     pub(crate) fn print(&self, padding: usize, file: &mut Box<dyn Write>) -> io::Result<()> {
         // let items = self.children.take();
         let name = self.fname.to_string_lossy();
-        writeln!(
-            file,
-            "{}{} ",
-            " ".repeat(padding),
-            name
-        )?;
+        writeln!(file, "{}{} ", " ".repeat(padding), name)?;
 
         Ok(())
     }
@@ -80,49 +74,53 @@ impl Ord for SmartPath {
 }
 
 static CURRENT_THREADS_COUNT: AtomicU32 = AtomicU32::new(0);
-const THREADS_MAX_COUNT: u32 = 10;
+static THREADS_MAX_COUNT: LazyLock<u32> = LazyLock::new(|| num_cpus::get() as u32);
+#[inline]
+fn increase_threads_count() -> bool {
+    loop {
+        let old = CURRENT_THREADS_COUNT.load(core::sync::atomic::Ordering::Acquire);
+        if old < *THREADS_MAX_COUNT {
+            let ans = CURRENT_THREADS_COUNT.compare_exchange(
+                old,
+                old + 1,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            if let Err(_) = ans {
+                // atomic error, continue
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+}
 fn search_in_threads<'c>(
-    // scope: &Scope,
     folder: &PathBuf,
-    sender: &Arc<Sender<Occurrence>>,
-) -> Result<(), io::Error> {
-    // let mut ans: LinkedList<Occurrence> = LinkedList::new();
+    // for some reason when I pass &Sender, the code runs forever, idk why
+    // it's possible to pass &Arc<Sender> and Arc<Sender> and the code start working
+    sender: Sender<Occurrence>,
+) -> Result<(), Error> {
     thread::scope(move |scope: &Scope| {
         let files = fs::read_dir(folder)?;
         for file in files.into_iter() {
             let file = file?;
             let value = if file.file_type()?.is_dir() {
-                // let path = SmartPath::new(file.path());
-                // let files_new = fs::read_dir(&file.path())?;
                 let file_clone = file.path().clone();
                 // trying to use pseudo-semaphore
-                loop {
-                    let old = CURRENT_THREADS_COUNT.load(core::sync::atomic::Ordering::Acquire);
-                    if old < THREADS_MAX_COUNT {
-                        let ans = CURRENT_THREADS_COUNT.compare_exchange(
-                            old,
-                            old + 1,
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-                        if let Err(e) = ans {
-                            continue;
-                        }
-                        scope.spawn(move || {
-                            let path = file.path().clone();
-                            search_in_threads(&path, sender).expect("search_in_threads failed");
-                            CURRENT_THREADS_COUNT
-                                .fetch_sub(1, core::sync::atomic::Ordering::Release);
-                        });
-                        break;
-                    } else {
+                if increase_threads_count() {
+                    let clone = sender.clone();
+                    scope.spawn(move || {
                         let path = file.path().clone();
-                        search_in_threads(&path, sender).expect("search_in_threads failed");
-                        break;
-                    }
+                        search_in_threads(&path, clone).expect("search_in_threads failed");
+                        CURRENT_THREADS_COUNT.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+                    });
+                } else {
+                    // do it synchronously
+                    let path = file.path().clone();
+                    search_in_threads(&path, sender.clone()).expect("search_in_threads failed");
                 }
-                // let data: Vec<&Occurrence> = recursive.iter().collect();
-                // path.children.replace(data);
+
                 Occurrence::Directory(Arc::new(file_clone))
             } else if file.file_name().to_string_lossy().ends_with(".txt")
                 || file.file_name().to_string_lossy().ends_with(".rs")
@@ -153,7 +151,7 @@ pub fn file_search(
 
     let (sender, receiver) = channel();
     // let ans = thread::scope(|scope: Scope| {
-    search_in_threads(folder, &Arc::new(sender))?;
+    search_in_threads(folder, sender)?;
     // });
     let ans: Vec<Occurrence> = receiver.iter().collect();
 
@@ -204,8 +202,10 @@ fn should_include<'c>(
         }
     }
     if let Some(find) = find.as_ref().and_then(|p| p.file_name()) {
-        let name= match item {
-            Occurrence::File(q) | Occurrence::TextFile(q) | Occurrence::Directory(q) =>  q.as_ref().file_name(),
+        let name = match item {
+            Occurrence::File(q) | Occurrence::TextFile(q) | Occurrence::Directory(q) => {
+                q.as_ref().file_name()
+            }
         };
         match name {
             None => return Ok(false),

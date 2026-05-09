@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 argh = "0.1.19"
+num_cpus = "1.17.0"
+log = "0.4.29"
