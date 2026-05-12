@@ -1,11 +1,15 @@
 use crate::sort::mergesort;
-use std::cell::Cell;
+use log::debug;
+use num_cpus;
 use std::cmp::Ordering;
-use std::collections::LinkedList;
 use std::io::{Error, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::{fs, io};
+use std::sync::atomic::AtomicU32;
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, LazyLock};
+use std::thread::spawn;
+use std::{fs, io, thread};
 
 pub struct SearchArgs<'c> {
     pub folder: &'c PathBuf,
@@ -15,37 +19,27 @@ pub struct SearchArgs<'c> {
 }
 
 enum Occurrence {
-    File(Rc<PathBuf>),
-    Directory(SmartPath),
-    TextFile(Rc<PathBuf>),
+    File(Arc<PathBuf>),
+    Directory(Arc<PathBuf>),
+    TextFile(Arc<PathBuf>),
 }
 
 pub struct SmartPath {
     fname: Rc<PathBuf>,
-    children: Rc<Cell<Vec<SmartPath>>>,
+    // children: Rc<Cell<Vec<SmartPath>>>,
 }
 impl SmartPath {
     fn new(string: PathBuf) -> SmartPath {
         SmartPath {
             fname: Rc::new(string),
-            children: Rc::new(Cell::new(Vec::with_capacity(0))),
+            // children: Rc::new(Cell::new(Vec::with_capacity(0))),
         }
     }
     pub(crate) fn print(&self, padding: usize, file: &mut Box<dyn Write>) -> io::Result<()> {
-        let items = self.children.take();
+        // let items = self.children.take();
         let name = self.fname.to_string_lossy();
-        writeln!(
-            file,
-            "{}{}{}",
-            " ".repeat(padding),
-            name,
-            if items.is_empty() { "" } else { "/" }
-        )?;
+        writeln!(file, "{}{} ", " ".repeat(padding), name)?;
 
-        for child in items.iter() {
-            child.print(padding + name.len() + 1, file)?
-        }
-        self.children.set(items);
         Ok(())
     }
 }
@@ -54,7 +48,6 @@ impl Clone for SmartPath {
     fn clone(&self) -> Self {
         SmartPath {
             fname: self.fname.clone(),
-            children: self.children.clone(),
         }
     }
 }
@@ -80,6 +73,84 @@ impl Ord for SmartPath {
     }
 }
 
+static CURRENT_THREADS_COUNT: AtomicU32 = AtomicU32::new(0);
+static THREADS_MAX_COUNT: LazyLock<u32> = LazyLock::new(|| num_cpus::get() as u32);
+#[inline]
+fn increase_threads_count() -> bool {
+    loop {
+        let old = CURRENT_THREADS_COUNT.load(core::sync::atomic::Ordering::Acquire);
+        if old < *THREADS_MAX_COUNT {
+
+            let new = old + 1;
+
+            let ans = CURRENT_THREADS_COUNT.compare_exchange(
+                old,
+                new,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            if let Err(_) = ans {
+                // atomic error, continue
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+}
+struct SmartStructHelperDecreaseCurrentThreadsCount{}
+impl Drop for SmartStructHelperDecreaseCurrentThreadsCount {
+    fn drop(&mut self) {
+        CURRENT_THREADS_COUNT.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+fn search_in_threads<'c>(
+    folder: &PathBuf,
+    // for some reason when I pass &Sender, the code runs forever, idk why
+    // it's possible to pass &Arc<Sender> and Arc<Sender> and the code start working
+    sender: Sender<Occurrence>,
+) -> Result<(), Error> {
+    // thread::scope(move |scope: &Scope| {
+    let files = fs::read_dir(folder)?;
+    for file in files.into_iter() {
+        let file = file?;
+        let value = if file.file_type()?.is_dir() {
+            let file_clone = file.path().clone();
+            // trying to use pseudo-semaphore
+            if increase_threads_count() {
+                let clone = sender.clone();
+                spawn(move || {
+                    let q = SmartStructHelperDecreaseCurrentThreadsCount{};
+                    let path = file.path().clone();
+                    search_in_threads(&path, clone).expect("search_in_threads failed");
+                    // decrease the atomic value even if thread panics
+                    drop(q);
+                });
+            } else {
+                // do it synchronously
+                let path = file.path().clone();
+                search_in_threads(&path, sender.clone()).expect("search_in_threads failed");
+            }
+
+            Occurrence::Directory(Arc::new(file_clone))
+        }
+        else if file.file_name().to_string_lossy().ends_with(".txt")
+            || file.file_name().to_string_lossy().ends_with(".rs")
+        {
+            Occurrence::TextFile(Arc::new(file.path()))
+        } else {
+            Occurrence::File(Arc::new(file.path()))
+        };
+
+        if let Err(err) = sender.send(value) {
+            return Err(io::Error::new(io::ErrorKind::Other, err.to_string()));
+        };
+    }
+
+    // Ok(())
+    // })?;
+    Ok(())
+}
 pub fn file_search(
     SearchArgs {
         folder,
@@ -88,31 +159,13 @@ pub fn file_search(
         in_file,
     }: SearchArgs,
 ) -> Result<Vec<SmartPath>, io::Error> {
-    let mut ans: LinkedList<Occurrence> = LinkedList::new();
+    // LinkedList::new();
 
-    let files = fs::read_dir(folder)?;
-    for file in files {
-        let file = file?;
-        let value = if file.file_type()?.is_dir() {
-            let path = SmartPath::new(file.path());
-            let recursive = file_search(SearchArgs {
-                folder: &file.path(),
-                find,
-                sort,
-                in_file,
-            })?;
-            path.children.replace(recursive);
-            Occurrence::Directory(path)
-        } else if file.file_name().to_string_lossy().ends_with(".txt")
-            || file.file_name().to_string_lossy().ends_with(".rs")
-        {
-            Occurrence::TextFile(Rc::new(file.path()))
-        } else {
-            Occurrence::File(Rc::new(file.path()))
-        };
-
-        ans.push_back(value);
-    }
+    let (sender, receiver) = channel();
+    // let ans = thread::scope(|scope: Scope| {
+    search_in_threads(folder, sender)?;
+    // });
+    let ans = receiver.iter();
 
     let mut answer: Vec<SmartPath> = Vec::new();
     for i in ans {
@@ -123,7 +176,8 @@ pub fn file_search(
                     answer.push(SmartPath::new(path));
                 }
                 Occurrence::Directory(i) => {
-                    answer.push(i);
+                    let q = (*i).clone();
+                    answer.push(SmartPath::new(q));
                 }
             };
         }
@@ -131,7 +185,7 @@ pub fn file_search(
     if sort {
         mergesort(&mut answer);
     }
-    Ok(answer)
+    Ok(answer.iter().map(|e| e.clone()).collect())
 }
 
 #[inline]
@@ -155,15 +209,15 @@ fn should_include<'c>(
                     }
                 }
             }
-        }
-        else{
+        } else {
             return Ok(false);
         }
     }
     if let Some(find) = find.as_ref().and_then(|p| p.file_name()) {
         let name = match item {
-            Occurrence::File(q) | Occurrence::TextFile(q) => q.as_ref().file_name(),
-            Occurrence::Directory(q) => q.fname.as_ref().file_name(),
+            Occurrence::File(q) | Occurrence::TextFile(q) | Occurrence::Directory(q) => {
+                q.as_ref().file_name()
+            }
         };
         match name {
             None => return Ok(false),

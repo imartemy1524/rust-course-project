@@ -10,6 +10,7 @@ use std::io;
 use std::io::{Error, Write};
 use std::path::PathBuf;
 use std::process::{exit, Termination};
+use std::time::Instant;
 
 #[derive(FromArgs)]
 ///
@@ -47,8 +48,11 @@ fn run(args: Arguments) -> io::Result<()> {
 }
 fn main() {
     let args: Arguments = argh::from_env();
+    let start_time = Instant::now();
     if let Err(e) = run(args) {
         eprintln!("Error: {}", e);
         exit(1);
     }
+    let elapsed = start_time.elapsed();
+    println!("Time elapsed: {:?}", elapsed);
 }
