@@ -1,15 +1,15 @@
 use crate::sort::mergesort;
+use log::debug;
 use num_cpus;
 use std::cmp::Ordering;
 use std::io::{Error, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, LazyLock};
-use std::thread::Scope;
+use std::thread::spawn;
 use std::{fs, io, thread};
-use log::debug;
 
 pub struct SearchArgs<'c> {
     pub folder: &'c PathBuf,
@@ -80,9 +80,12 @@ fn increase_threads_count() -> bool {
     loop {
         let old = CURRENT_THREADS_COUNT.load(core::sync::atomic::Ordering::Acquire);
         if old < *THREADS_MAX_COUNT {
+
+            let new = old + 1;
+
             let ans = CURRENT_THREADS_COUNT.compare_exchange(
                 old,
-                old + 1,
+                new,
                 core::sync::atomic::Ordering::AcqRel,
                 core::sync::atomic::Ordering::Relaxed,
             );
@@ -95,48 +98,56 @@ fn increase_threads_count() -> bool {
         return false;
     }
 }
+struct SmartStructHelperDecreaseCurrentThreadsCount{}
+impl Drop for SmartStructHelperDecreaseCurrentThreadsCount {
+    fn drop(&mut self) {
+        CURRENT_THREADS_COUNT.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
 fn search_in_threads<'c>(
     folder: &PathBuf,
     // for some reason when I pass &Sender, the code runs forever, idk why
     // it's possible to pass &Arc<Sender> and Arc<Sender> and the code start working
     sender: Sender<Occurrence>,
 ) -> Result<(), Error> {
-    thread::scope(move |scope: &Scope| {
-        let files = fs::read_dir(folder)?;
-        for file in files.into_iter() {
-            let file = file?;
-            let value = if file.file_type()?.is_dir() {
-                let file_clone = file.path().clone();
-                // trying to use pseudo-semaphore
-                if increase_threads_count() {
-                    let clone = sender.clone();
-                    scope.spawn(move || {
-                        let path = file.path().clone();
-                        search_in_threads(&path, clone).expect("search_in_threads failed");
-                        CURRENT_THREADS_COUNT.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-                    });
-                } else {
-                    // do it synchronously
+    // thread::scope(move |scope: &Scope| {
+    let files = fs::read_dir(folder)?;
+    for file in files.into_iter() {
+        let file = file?;
+        let value = if file.file_type()?.is_dir() {
+            let file_clone = file.path().clone();
+            // trying to use pseudo-semaphore
+            if increase_threads_count() {
+                let clone = sender.clone();
+                spawn(move || {
+                    let q = SmartStructHelperDecreaseCurrentThreadsCount{};
                     let path = file.path().clone();
-                    search_in_threads(&path, sender.clone()).expect("search_in_threads failed");
-                }
-
-                Occurrence::Directory(Arc::new(file_clone))
-            } else if file.file_name().to_string_lossy().ends_with(".txt")
-                || file.file_name().to_string_lossy().ends_with(".rs")
-            {
-                Occurrence::TextFile(Arc::new(file.path()))
+                    search_in_threads(&path, clone).expect("search_in_threads failed");
+                    drop(q);
+                });
             } else {
-                Occurrence::File(Arc::new(file.path()))
-            };
+                // do it synchronously
+                let path = file.path().clone();
+                search_in_threads(&path, sender.clone()).expect("search_in_threads failed");
+            }
 
-            if let Err(err) = sender.send(value) {
-                return Err(io::Error::new(io::ErrorKind::Other, err.to_string()));
-            };
+            Occurrence::Directory(Arc::new(file_clone))
         }
+        else if file.file_name().to_string_lossy().ends_with(".txt")
+            || file.file_name().to_string_lossy().ends_with(".rs")
+        {
+            Occurrence::TextFile(Arc::new(file.path()))
+        } else {
+            Occurrence::File(Arc::new(file.path()))
+        };
 
-        Ok(())
-    })?;
+        if let Err(err) = sender.send(value) {
+            return Err(io::Error::new(io::ErrorKind::Other, err.to_string()));
+        };
+    }
+
+    // Ok(())
+    // })?;
     Ok(())
 }
 pub fn file_search(
@@ -153,7 +164,7 @@ pub fn file_search(
     // let ans = thread::scope(|scope: Scope| {
     search_in_threads(folder, sender)?;
     // });
-    let ans: Vec<Occurrence> = receiver.iter().collect();
+    let ans = receiver.iter();
 
     let mut answer: Vec<SmartPath> = Vec::new();
     for i in ans {
