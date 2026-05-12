@@ -123,6 +123,7 @@ fn search_in_threads<'c>(
                     let q = SmartStructHelperDecreaseCurrentThreadsCount{};
                     let path = file.path().clone();
                     search_in_threads(&path, clone).expect("search_in_threads failed");
+                    // decrease the atomic value even if thread panics
                     drop(q);
                 });
             } else {
